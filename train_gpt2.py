@@ -21,6 +21,7 @@ import math
 import glob
 import struct
 import inspect
+import random
 from contextlib import nullcontext
 from dataclasses import dataclass
 
@@ -35,8 +36,308 @@ from torch.distributed.optim import ZeroRedundancyOptimizer
 import torch.distributed as dist
 
 # -----------------------------------------------------------------------------
-# PyTorch nn.Module definitions for the GPT-2 model
+# PyTorch nn.Module definitions for the MCTS-RL model
 
+class MCTSNode:
+    def __init__(self, state, parent=None):
+        self.state = state
+        self.parent = parent
+        self.children = {}
+        self.visits = 0
+        self.value = 0
+
+class MCTS:
+    def __init__(self, model, config):
+        self.model = model
+        self.config = config
+
+    def search(self, root_state, num_simulations):
+        root = MCTSNode(root_state)
+        
+        for _ in range(num_simulations):
+            node = root
+            
+            # Selection
+            while node.children and node.state.size(1) < self.config.block_size:
+                if not all(n.visits > 0 for n in node.children.values()):
+                    node = random.choice([n for n in node.children.values() if n.visits == 0])
+                else:
+                    node = max(node.children.values(), key=lambda n: n.value / n.visits + math.sqrt(2 * math.log(node.visits) / n.visits))
+            
+            # Expansion
+            if node.state.size(1) < self.config.block_size:
+                logits, _, _, _, _ = self.model(node.state)
+                probs = F.softmax(logits[:, -1, :], dim=-1)
+                action = torch.multinomial(probs, num_samples=1)
+                new_state = torch.cat([node.state, action], dim=1)
+                new_node = MCTSNode(new_state, parent=node)
+                node.children[action.item()] = new_node
+                node = new_node
+            
+            # Simulation
+            final_state = node.state
+            while final_state.size(1) < self.config.block_size:
+                logits, _, _, _, _ = self.model(final_state)
+                probs = F.softmax(logits[:, -1, :], dim=-1)
+                action = torch.multinomial(probs, num_samples=1)
+                final_state = torch.cat([final_state, action], dim=1)
+            
+            # Evaluation
+            _, loss, _, _, _ = self.model(final_state, final_state)
+            value = -loss.item()  # Negative loss as value
+            
+            # Backpropagation
+            while node:
+                node.visits += 1
+                node.value += value
+                node = node.parent
+        
+        return max(root.children.values(), key=lambda n: n.visits).state
+    
+class MCTSRLDynamicStreamsConfig:
+    def __init__(self, 
+                 vocab_size=50257, 
+                 block_size=1024, 
+                 n_layer=12, 
+                 n_head=12, 
+                 n_embd=768,
+                 max_streams=8,
+                 min_streams=2,
+                 stream_growth_rate=0.8,
+                 stream_prune_rate=0.2,
+                 value_loss_coeff=0.01,
+                 diversity_loss_coeff=0.01,
+                 attn_pdrop=0.1,
+                 resid_pdrop=0.1,
+                 embd_pdrop=0.1,
+                 mcts_simulations=100,
+                 **kwargs):
+        self.vocab_size = vocab_size
+        self.block_size = block_size
+        self.n_layer = n_layer
+        self.n_head = n_head
+        self.n_embd = n_embd
+        self.max_streams = max_streams
+        self.min_streams = min_streams
+        self.stream_growth_rate = stream_growth_rate
+        self.stream_prune_rate = stream_prune_rate
+        self.value_loss_coeff = value_loss_coeff
+        self.diversity_loss_coeff = diversity_loss_coeff
+        self.attn_pdrop = attn_pdrop
+        self.resid_pdrop = resid_pdrop
+        self.embd_pdrop = embd_pdrop
+        self.mcts_simulations = mcts_simulations
+        
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+class MCTSRLDynamicStreamsAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.max_streams = config.max_streams
+        self.min_streams = config.min_streams
+        
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd * config.max_streams)
+        self.c_proj = nn.Linear(config.n_embd * config.max_streams, config.n_embd)
+        
+        self.streams = nn.ModuleList([self.create_stream() for _ in range(self.max_streams)])
+        self.active_streams = self.min_streams
+        
+        self.stream_selector = nn.Linear(config.n_embd, self.max_streams)
+        self.value_estimator = nn.Linear(config.n_embd, 1)
+        
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                     .view(1, 1, config.block_size, config.block_size))
+
+    def create_stream(self):
+        return nn.Sequential(
+            nn.Linear(self.n_embd, 3 * self.n_embd),
+            nn.Dropout(self.config.attn_pdrop)
+        )
+
+    def forward(self, x):
+        B, T, C = x.size()
+        
+        stream_outputs = []
+        for i in range(self.active_streams):
+            qkv = self.streams[i](x).split(self.n_embd, dim=2)
+            q, k, v = map(lambda t: t.view(B, T, self.n_head, C // self.n_head).transpose(1, 2), qkv)
+            
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            y = att @ v
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
+            stream_outputs.append(y)
+        
+        stacked_outputs = torch.stack(stream_outputs, dim=2)
+        
+        routing_logits = self.stream_selector(x)[:,:,:self.active_streams]
+        routing_weights = F.softmax(routing_logits, dim=-1)
+        
+        routed_output = torch.sum(routing_weights.unsqueeze(-1) * stacked_outputs, dim=2)
+        stream_values = self.value_estimator(routed_output)
+        
+        return routed_output, stream_values, routing_weights
+
+    def manage_streams(self, stream_usage):
+        if self.active_streams < self.max_streams and stream_usage.max() > self.config.stream_growth_rate:
+            self.active_streams += 1
+        elif self.active_streams > self.min_streams and stream_usage.min() < self.config.stream_prune_rate:
+            self.active_streams -= 1
+
+class MCTSRLDynamicStreamsBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = MCTSRLDynamicStreamsAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = nn.Sequential(
+            nn.Linear(config.n_embd, 4 * config.n_embd),
+            NewGELU(),
+            nn.Linear(4 * config.n_embd, config.n_embd),
+            nn.Dropout(config.resid_pdrop),
+        )
+
+    def forward(self, x):
+        attn_output, stream_values, routing_weights = self.attn(self.ln_1(x))
+        x = x + attn_output
+        x = x + self.mlp(self.ln_2(x))
+        return x, stream_values, routing_weights
+    
+class MCTSRLDynamicStreamsTransformer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
+            drop = nn.Dropout(config.embd_pdrop),
+            h = nn.ModuleList([MCTSRLDynamicStreamsBlock(config) for _ in range(config.n_layer)]),
+            ln_f = nn.LayerNorm(config.n_embd),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
+        self.apply(self._init_weights)
+        
+        self.mcts = MCTS(self, config)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+
+    def forward(self, idx, targets=None, return_logits=True):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)
+
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        
+        stream_values = []
+        routing_weights = []
+        for i, block in enumerate(self.transformer.h):
+            x, sv, rw = block(x)
+            stream_values.append(sv)
+            routing_weights.append(rw)
+            print(f"Layer {i}: x shape: {x.shape}, sv shape: {sv.shape}, rw shape: {rw.shape}")
+        
+        x = self.transformer.ln_f(x)
+        if return_logits:
+            logits = self.lm_head(x)
+            print(f"Logits shape: {logits.shape}")
+        else:
+            logits = None
+
+        if targets is not None:
+            if logits is None:
+                logits = self.lm_head(x)
+                
+            print(f"Targets shape: {targets.shape}")
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            print(f"Cross entropy loss: {loss.item()}")
+            
+            # RL-inspired value loss
+            value_loss = -torch.mean(torch.stack(stream_values))
+            print(f"Value loss: {value_loss.item()}")
+            
+            # Diversity loss
+            diversity_loss = self.calculate_diversity_loss(routing_weights)
+            print(f"Diversity loss: {diversity_loss.item()}")
+            
+            # Combined loss
+            total_loss = loss + self.config.value_loss_coeff * value_loss + self.config.diversity_loss_coeff * diversity_loss
+            print(f"Total loss: {total_loss.item()}")
+        else:
+            total_loss = None
+
+        return logits, total_loss, stream_values, routing_weights
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
+        return optimizer
+
+    def calculate_diversity_loss(self, routing_weights):
+        diversity_loss = 0
+        for rw in routing_weights:
+            entropy = -torch.sum(rw * torch.log(rw + 1e-10), dim=-1).mean()
+            diversity_loss -= entropy
+        return diversity_loss
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_mcts=False, mcts_simulations=None):
+        mcts_simulations = mcts_simulations or self.config.mcts_simulations
+        for _ in range(max_new_tokens):
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            
+            if use_mcts:
+                idx_next = self.mcts.search(idx_cond, mcts_simulations)[:, -1:]
+            else:
+                logits, _, _, _ = self(idx_cond)
+                logits = logits[:, -1, :] / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+            
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
+
+
+# -----------------------------------------------------------------------------
+# PyTorch nn.Module definitions for the GPT-2 model
 class NewGELU(nn.Module):
     """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
     def forward(self, input):
@@ -124,7 +425,12 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
-
+    max_streams: int = 8
+    min_streams: int = 2
+    stream_growth_rate: float = 0.8
+    stream_prune_rate: float = 0.2
+    value_loss_coeff: float = 0.01
+    diversity_loss_coeff: float = 0.01
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -192,7 +498,7 @@ class GPT(nn.Module):
     @classmethod
     def from_pretrained(cls, model_type):
         """Loads pretrained GPT-2 model weights from huggingface"""
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl', 'mcts_rl'}
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
@@ -394,6 +700,7 @@ def write_bf16(tensor, file):
 
 def write_tensors(model_tensors, L, file, dtype):
     # writes the GPT-2 model's weights to a binary file
+    '''
     assert dtype in {"float32", "bfloat16"}
     write_fun = write_fp32 if dtype == "float32" else write_bf16
     write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
@@ -424,7 +731,56 @@ def write_tensors(model_tensors, L, file, dtype):
         write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
     write_fun(model_tensors["transformer.ln_f.weight"], file) # (C, )
     write_fun(model_tensors["transformer.ln_f.bias"], file) # (C, )
+    '''
+    # writes the model's weights to a binary file
+    assert dtype in {"float32", "bfloat16"}
+    write_fun = write_fp32 if dtype == "float32" else write_bf16
+    write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
+    write_fun(model_tensors["transformer.wpe.weight"], file) # (T, C)
+    for i in range(L):
+        # Layer norm 1
+        write_fun(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
+        
+        # Attention
+        if f"transformer.h.{i}.attn.c_attn.weight" in model_tensors:
+            # Original GPT-2 structure
+            write_fun(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
+            write_fun(model_tensors[f"transformer.h.{i}.attn.c_attn.bias"], file)
+            write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
+            write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
+        elif f"transformer.h.{i}.attn.c_proj.weight" in model_tensors:
+            # MCTSRLDynamicStreamsTransformer structure
+            write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
+            write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
+            write_fun(model_tensors[f"transformer.h.{i}.attn.stream_selector.weight"], file)
+            write_fun(model_tensors[f"transformer.h.{i}.attn.stream_selector.bias"], file)
+            write_fun(model_tensors[f"transformer.h.{i}.attn.value_estimator.weight"], file)
+            write_fun(model_tensors[f"transformer.h.{i}.attn.value_estimator.bias"], file)
+            for j in range(model_tensors[f"transformer.h.{i}.attn.streams.0.0.weight"].size(0) // 3):
+                write_fun(model_tensors[f"transformer.h.{i}.attn.streams.{j}.0.weight"], file)
+                write_fun(model_tensors[f"transformer.h.{i}.attn.streams.{j}.0.bias"], file)
+        
+        # Layer norm 2
+        write_fun(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
+        
+        # MLP
+        if f"transformer.h.{i}.mlp.c_fc.weight" in model_tensors:
+            # Original GPT-2 structure
+            write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
+            write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.bias"], file)
+            write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
+            write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
+        elif f"transformer.h.{i}.mlp.0.weight" in model_tensors:
+            # MCTSRLDynamicStreamsTransformer structure
+            write_fun(model_tensors[f"transformer.h.{i}.mlp.0.weight"], file)
+            write_fun(model_tensors[f"transformer.h.{i}.mlp.0.bias"], file)
+            write_fun(model_tensors[f"transformer.h.{i}.mlp.2.weight"], file)
+            write_fun(model_tensors[f"transformer.h.{i}.mlp.2.bias"], file)
 
+    write_fun(model_tensors["transformer.ln_f.weight"], file) # (C, )
+    write_fun(model_tensors["transformer.ln_f.bias"], file) # (C, )
 @torch.no_grad()
 def pad_vocab(tensor, multiple=128, value=0):
     """
@@ -485,7 +841,8 @@ def write_state(model, x, y, logits, loss, filename):
     header[1] = 2 # run state version = 2 (1 -> 2 for padded vocab changes)
     header[2] = x.size(0) # batch size of the batch, B
     header[3] = x.size(1) # temporal extent of the batch, T
-    grads = {name: param.grad.cpu() for name, param in model.named_parameters()}
+    grads = {name: (param.grad.cpu() if param.grad is not None else torch.zeros_like(param).cpu()) 
+             for name, param in model.named_parameters()}
     # pad the vocab grads here as well, to mirror write_model
     wte_grad = grads["transformer.wte.weight"] # (V, C)
     wte_grad_padded = pad_vocab(wte_grad, value=0) # (Vp, C) # TODO later maybe pad with nan?
@@ -545,7 +902,8 @@ if __name__ == "__main__":
     parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
     parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
-    parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48")
+    parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48|mcts_rl")
+
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
@@ -575,13 +933,18 @@ if __name__ == "__main__":
     parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
     # python -> C bridge
     parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
+
+    # MCTS RL
+    parser.add_argument("--use_mcts", type=int, default=0, help="use MCTS for generation")
+    parser.add_argument("--mcts_simulations", type=int, default=100, help="number of MCTS simulations")
+
     args = parser.parse_args()
 
     # args error checking and convenience variables
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
     assert args.dtype in {"float32", "float16", "bfloat16"}
-    assert args.model in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl", "d12", "d24", "d36", "d48"}
+    assert args.model in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl", "d12", "d24", "d36", "d48", "mcts_rl"}
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -649,15 +1012,17 @@ if __name__ == "__main__":
         write_tokenizer(enc, "gpt2_tokenizer.bin")
 
     # init the model, either from scratch or from OpenAI pretrained checkpoint
-    if args.model[0] == "d":
+    if args.model[0] == "d" or args.model[0] == "m":
         # from scratch (random weights)
         model_config = {
             "d12": GPTConfig(block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768),
             "d24": GPTConfig(block_size=1024, vocab_size=50257, n_layer=24, n_head=16, n_embd=1024),
             "d36": GPTConfig(block_size=1024, vocab_size=50257, n_layer=36, n_head=20, n_embd=1280),
             "d48": GPTConfig(block_size=1024, vocab_size=50257, n_layer=48, n_head=25, n_embd=1600),
+            "mcts_rl": MCTSRLDynamicStreamsConfig(block_size=1024, vocab_size=50257, n_layer=24, n_head=16, n_embd=1024),
         }[args.model]
-        model = GPT(model_config)
+        #model = GPT(model_config)
+        model = MCTSRLDynamicStreamsTransformer(model_config)
     else:
         # load the GPT-2 model weights
         model = GPT.from_pretrained(args.model)
@@ -685,20 +1050,36 @@ if __name__ == "__main__":
     if master_process and args.write_tensors and (not args.inference_only):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        logits, loss = model(x, y)
-        loss.backward()
+        print(f"Input shapes: x: {x.shape}, y: {y.shape}")
+        try:
+            logits, total_loss, stream_values, routing_weights = model(x, y)
+            print(f"Forward pass successful. Logits shape: {logits.shape}, Total loss: {total_loss.item()}")
+            loss = total_loss
+            loss.backward()
+            print("Backward pass successful")
+        except Exception as e:
+            print(f"Error during forward or backward pass: {e}")
+            import traceback
+            traceback.print_exc()
+        
         # save model params, in both float32 and bfloat16
-        model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
+        model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M", "mcts_rl": "355M"}
         model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
         model_size_str = model_to_size[args.model] # e.g. "124M", or "d12"
         write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
         write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
+        
         # save x, y, logits, loss, and parameter gradients, for debugging C
-        # always store these in fp32 to have an accurate reference (?)
-        write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
+        try:
+            write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
+            print(f"Successfully wrote debug state to gpt2_{model_size_str}_debug_state.bin")
+        except Exception as e:
+            print(f"Error writing debug state: {e}")
+            import traceback
+            traceback.print_exc()
+        
         # reset the train_loader for the optimization below
         train_loader.reset()
-
     # -------------------------------------------------------------------------
     # main training loop
 
@@ -708,9 +1089,17 @@ if __name__ == "__main__":
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
     # init the optimizer
-    optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
-                                               learning_rate=args.learning_rate, betas=(0.9, 0.95),
-                                               device_type=device, zero_stage=zero_stage)
+    # Optimizer setup
+    try:
+        optimizer = model.configure_optimizers(weight_decay=args.weight_decay,
+                                            learning_rate=args.learning_rate,
+                                            betas=(0.9, 0.95),
+                                            device_type=device_type)
+        print("Optimizer configured successfully")
+    except Exception as e:
+        print(f"Error configuring optimizer: {e}")
+        import traceback
+        traceback.print_exc()
 
     # learning rate decay scheduler (cosine with warmup)
     def get_lr(it):
@@ -776,7 +1165,10 @@ if __name__ == "__main__":
             max_new_tokens = 32
             temperature = 1.0
             top_k = 40
-            yg = raw_model.generate(xg, max_new_tokens, temperature=temperature, top_k=top_k)
+            if args.use_mcts:
+                yg = raw_model.generate(xg, max_new_tokens, temperature=temperature, top_k=top_k, use_mcts=True, mcts_simulations=100)
+            else:
+                yg = raw_model.generate(xg, max_new_tokens, temperature=temperature, top_k=top_k)
             print0('---------------')
             print0(enc.decode(yg[0].tolist()))
             print0('---------------')
@@ -807,7 +1199,7 @@ if __name__ == "__main__":
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             # forward pass
             with ctx:
-                _, loss = model(x, y, return_logits=False)
+                logits, loss, _, _ = model(x, y)
                 # we have to scale the loss to account for gradient accumulation,
                 # because the gradients just add on each successive backward().
                 # addition of gradients corresponds to a SUM in the objective, but
